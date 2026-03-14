@@ -11,6 +11,17 @@ on:
       - master
   workflow_dispatch:
 
+# Pages deployment requires these top-level permissions
+permissions:
+  contents:      read
+  packages:      write
+  pages:         write
+  id-token:      write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
 env:
   IMAGE_NAME: boyjack-os
   REGISTRY: ghcr.io
@@ -126,6 +137,24 @@ jobs:
             -e HOME=/app \
             ${{ env.REGISTRY_IMAGE }}:latest
 
+      # ── No fixed timeout: poll until the service answers ─────────────────
+      - name: Auto-detect service health — web port 5000 (no timeout)
+        run: |
+          echo "Polling http://localhost:5000/vnc.html until ready..."
+          attempt=0
+          while true; do
+            attempt=$((attempt + 1))
+            STATUS=$(curl -o /dev/null -s -w "%{http_code}" \
+                     --max-time 5 \
+                     http://localhost:5000/vnc.html 2>/dev/null || echo "000")
+            echo "  [attempt $attempt] HTTP $STATUS"
+            if [ "$STATUS" = "200" ]; then
+              echo "Web interface is healthy (HTTP 200) after $attempt attempts."
+              break
+            fi
+            sleep 5
+          done
+
       - name: Verify VNC port 5901 is open
         run: |
           echo "Checking VNC port 5901..."
@@ -149,7 +178,85 @@ jobs:
         run: docker rm -f boyjack-test || true
 
   # ─────────────────────────────────────────────────────────────────────────
-  # JOB 3a — Deploy to remote server via SSH key-based authentication
+  # JOB 3 — Deploy to GitHub Pages (static noVNC web interface)
+  #
+  # Publishes www/ (noVNC client + boot screen) to GitHub Pages so the
+  # frontend is accessible without running a container.
+  #
+  # One-time setup: Settings → Pages → Source → "GitHub Actions"
+  #
+  # Live URLs after deploy:
+  #   https://<owner>.github.io/<repo>/
+  #   https://<owner>.github.io/<repo>/vnc.html?host=SERVER&port=5901
+  #   https://<owner>.github.io/<repo>/boyjack-boot.html
+  # ─────────────────────────────────────────────────────────────────────────
+  deploy-pages:
+    name: Deploy to GitHub Pages
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name != 'pull_request'
+    environment:
+      name: github-pages
+      url: ${{ steps.pages-deploy.outputs.page_url }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up GitHub Pages
+        uses: actions/configure-pages@v4
+
+      # Inject vnc_config.js — reads host/port from URL query params at runtime
+      # Uses printf to avoid << YAML merge-key conflicts
+      - name: Inject VNC connection config (vnc_config.js)
+        run: |
+          printf '%s\n' \
+            '// BoyJack OS — VNC connection defaults for GitHub Pages' \
+            '// Connect the client to your server via URL params:' \
+            '//   vnc.html?host=YOUR_SERVER_IP&port=5901&encrypt=1' \
+            '(function () {' \
+            '  var p = new URLSearchParams(window.location.search);' \
+            '  window.VNC_connection_host    = p.get("host")    || "";' \
+            '  window.VNC_connection_port    = p.get("port")    || "5901";' \
+            '  window.VNC_connection_encrypt = p.get("encrypt") === "1";' \
+            '  window.VNC_connection_path    = p.get("path")    || "websockify";' \
+            '})();' \
+            > www/vnc_config.js
+
+      # Patch vnc.html to load the config before the noVNC core scripts
+      - name: Patch vnc.html to load vnc_config.js
+        run: |
+          if ! grep -q 'vnc_config.js' www/vnc.html; then
+            sed -i 's|</head>|<script src="vnc_config.js"></script>\n</head>|' www/vnc.html
+          fi
+
+      # Keep the boot screen in sync with the repo root copy
+      - name: Copy boot screen into www/
+        run: cp -f boyjack-boot.html www/boyjack-boot.html
+
+      # 404 redirect for SPA-style navigation
+      - name: Create 404 redirect
+        run: cp www/index.html www/404.html
+
+      - name: Upload Pages artifact (www/)
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: www/
+
+      - name: Deploy to GitHub Pages
+        id: pages-deploy
+        uses: actions/deploy-pages@v4
+
+      - name: Print Pages URLs
+        run: |
+          echo "=== GitHub Pages deployed ==="
+          echo "  Root       : ${{ steps.pages-deploy.outputs.page_url }}"
+          echo "  Boot screen: ${{ steps.pages-deploy.outputs.page_url }}boyjack-boot.html"
+          echo "  VNC client : ${{ steps.pages-deploy.outputs.page_url }}vnc.html"
+          echo "  Connect    : ${{ steps.pages-deploy.outputs.page_url }}vnc.html?host=SERVER_IP&port=5901"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 4a — Deploy to remote server via SSH key-based authentication
   #
   # How to generate the key pair (run locally):
   #   ssh-keygen -t ed25519 -C "github-actions-boyjack" -f boyjack_deploy
@@ -276,7 +383,7 @@ jobs:
         run: rm -f ~/.ssh/boyjack_deploy ~/.ssh/boyjack_deploy.pub ~/.ssh/config
 
   # ─────────────────────────────────────────────────────────────────────────
-  # JOB 3 — Summary notification (always runs)
+  # JOB 4 — Summary notification (always runs)
   # ─────────────────────────────────────────────────────────────────────────
   notify:
     name: Deployment Summary
