@@ -7,33 +7,43 @@ FROM nixos/nix:latest
 
 WORKDIR /app
 
-# ── Enable nixpkgs channel so nix-env can resolve packages ───────────────
-RUN nix-channel --add https://nixos.org/channels/nixpkgs-unstable nixpkgs \
- && nix-channel --update
+# ── Configure Nix for Docker ──────────────────────────────────────────────
+# Docker does not support Nix sandboxing or user namespaces.
+# filter-syscalls must be off to allow Nix builds inside a container.
+RUN mkdir -p /etc/nix && printf '%s\n' \
+    'sandbox = false' \
+    'filter-syscalls = false' \
+    'experimental-features = nix-command flakes' \
+    >> /etc/nix/nix.conf
 
-# ── Permanently install all packages via nix-env -iA ─────────────────────
-# nix-shell only creates a temporary scope; nix-env writes to /root/.nix-profile
-# which persists across RUN layers and is available at container runtime.
-RUN nix-env -iA \
-    nixpkgs.novnc \
-    nixpkgs.tigervnc \
-    nixpkgs.xterm \
-    nixpkgs.fluxbox \
-    nixpkgs.firefox \
-    nixpkgs.gedit \
-    nixpkgs.pcmanfm \
-    nixpkgs.feh \
-    nixpkgs.xorg.xinit \
-    nixpkgs.xorg.xauth \
-    nixpkgs.xorg.xsetroot \
-    nixpkgs.xorg.xrandr \
-    nixpkgs.python3 \
-    nixpkgs.xdotool \
-    nixpkgs.tcl \
-    nixpkgs.curl \
-    nixpkgs.wget \
-    nixpkgs.git \
-    nixpkgs.bash
+# ── Add nixpkgs channel AND install all packages in one RUN layer ─────────
+# Combining into a single RUN ensures the channel is available to nix-env.
+# Splitting into two RUN commands risks the channel not persisting between layers.
+RUN nix-channel --add https://nixos.org/channels/nixpkgs-unstable nixpkgs \
+ && nix-channel --update \
+ && nix-env -iA \
+      nixpkgs.tigervnc \
+      nixpkgs.novnc \
+      nixpkgs.xterm \
+      nixpkgs.fluxbox \
+      nixpkgs.firefox \
+      nixpkgs.pcmanfm \
+      nixpkgs.feh \
+      nixpkgs.xorg.xinit \
+      nixpkgs.xorg.xauth \
+      nixpkgs.xorg.xsetroot \
+      nixpkgs.xorg.xrandr \
+      nixpkgs.python3 \
+      nixpkgs.xdotool \
+      nixpkgs.tcl \
+      nixpkgs.curl \
+      nixpkgs.wget \
+      nixpkgs.git \
+      nixpkgs.bash \
+      nixpkgs.netcat \
+ && nix-env -iA nixpkgs.gnome.gedit 2>/dev/null \
+    || nix-env -iA nixpkgs.gedit \
+ && nix-collect-garbage -d
 
 # ── Copy BoyJack OS files ─────────────────────────────────────────────────
 COPY start.sh start_button.tcl boyjack-boot.html LICENSE ./
@@ -46,10 +56,9 @@ ENV DISPLAY=:1 \
     PORT=5000
 
 # ── Health check — auto-detects service health, no timeout ───────────────
-# Checks noVNC web first; falls back to VNC port probe
 HEALTHCHECK --interval=15s --start-period=0s --retries=0 \
-  CMD curl -f http://localhost:5000/vnc.html 2>/dev/null || \
-      nc -z localhost 5901
+  CMD curl -f http://localhost:5000/vnc.html 2>/dev/null \
+      || nc -z localhost 5901
 
 # ── Ports ─────────────────────────────────────────────────────────────────
 EXPOSE 5000 5901
