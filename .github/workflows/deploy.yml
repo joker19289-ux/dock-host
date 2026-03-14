@@ -167,6 +167,145 @@ jobs:
         run: docker rm -f boyjack-test || true
 
   # ─────────────────────────────────────────────────────────────────────────
+  # JOB 3a — Deploy to remote server via SSH key-based authentication
+  #
+  # How to generate the key pair (run locally):
+  #   ssh-keygen -t ed25519 -C "github-actions-boyjack" -f boyjack_deploy
+  #   # → private key: boyjack_deploy
+  #   # → public  key: boyjack_deploy.pub
+  #   cat boyjack_deploy.pub >> ~/.ssh/authorized_keys   # on the server
+  #
+  # GitHub Secrets required (Settings → Secrets → Actions):
+  #   SERVER_HOST     — IP address or hostname of the target server
+  #   SERVER_USER     — SSH login username  (e.g. root, ubuntu, deploy)
+  #   SERVER_SSH_KEY  — contents of the private key file (boyjack_deploy)
+  #   SERVER_SSH_PUB  — contents of the public  key file (boyjack_deploy.pub)
+  #
+  # Optional secret:
+  #   SERVER_PORT     — SSH port (defaults to 22)
+  # ─────────────────────────────────────────────────────────────────────────
+  deploy-ssh:
+    name: Deploy to Server (SSH key-based auth)
+    runs-on: ubuntu-latest
+    needs: [build, healthcheck]
+    if: |
+      github.event_name != 'pull_request' &&
+      secrets.SERVER_HOST != '' &&
+      secrets.SERVER_SSH_KEY != ''
+    environment: production
+
+    env:
+      SSH_HOST: ${{ secrets.SERVER_HOST }}
+      SSH_USER: ${{ secrets.SERVER_USER }}
+      SSH_PORT: ${{ secrets.SERVER_PORT || '22' }}
+
+    steps:
+      # ── 1. Write private key & configure SSH client ──────────────────────
+      - name: Set up SSH key-based authentication
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          # Write private key (Ed25519 or RSA — any format accepted)
+          printf '%s\n' "${{ secrets.SERVER_SSH_KEY }}" > ~/.ssh/boyjack_deploy
+          chmod 600 ~/.ssh/boyjack_deploy
+
+          # Write public key (optional but good practice)
+          if [ -n "${{ secrets.SERVER_SSH_PUB }}" ]; then
+            printf '%s\n' "${{ secrets.SERVER_SSH_PUB }}" > ~/.ssh/boyjack_deploy.pub
+            chmod 644 ~/.ssh/boyjack_deploy.pub
+          fi
+
+          # Scan and trust the server's host key (replaces manual known_hosts)
+          ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          chmod 600 ~/.ssh/known_hosts
+
+          # SSH client config: use only our deploy key, no password fallback
+          cat >> ~/.ssh/config << EOF
+          Host boyjack-server
+            HostName       $SSH_HOST
+            User           $SSH_USER
+            Port           $SSH_PORT
+            IdentityFile   ~/.ssh/boyjack_deploy
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            PasswordAuthentication no
+            ServerAliveInterval 30
+            ServerAliveCountMax 0
+          EOF
+          chmod 600 ~/.ssh/config
+
+      # ── 2. Verify the key is accepted before deploying ───────────────────
+      - name: Verify SSH key authentication
+        run: |
+          ssh boyjack-server "echo 'SSH key auth OK — connected as $(whoami) on $(hostname)'"
+
+      # ── 3. Rolling deploy via SSH ─────────────────────────────────────────
+      - name: Deploy BoyJack OS
+        run: |
+          ssh boyjack-server bash -s << 'REMOTE'
+          set -e
+
+          echo "=== BoyJack OS — Rolling Deploy ==="
+          echo "    Base  : nixos/nix:latest"
+          echo "    Image : ${{ env.REGISTRY_IMAGE }}:latest"
+          echo "    Web   : 5000 | VNC : 5901"
+
+          # Authenticate with GHCR
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+          # Pull latest image
+          docker pull ${{ env.REGISTRY_IMAGE }}:latest
+
+          # Gracefully stop & remove old container
+          docker stop boyjack-os 2>/dev/null || true
+          docker rm   boyjack-os 2>/dev/null || true
+
+          # Start new container — health check polls indefinitely (no timeout)
+          docker run -d \
+            --name boyjack-os \
+            --restart unless-stopped \
+            -p 5000:5000 \
+            -p 5901:5901 \
+            -e DISPLAY=:1 \
+            -e HOME=/app \
+            --health-cmd      "curl -f http://localhost:5000/vnc.html || nc -z localhost 5901" \
+            --health-interval 15s \
+            --health-retries  0 \
+            --health-start-period 0s \
+            ${{ env.REGISTRY_IMAGE }}:latest
+
+          echo ""
+          echo "=== Waiting for container to become healthy (no timeout) ==="
+          while true; do
+            STATUS=$(docker inspect --format='{{.State.Health.Status}}' boyjack-os 2>/dev/null || echo "unknown")
+            echo "  Health status: $STATUS"
+            if [ "$STATUS" = "healthy" ]; then
+              echo "Container is healthy!"
+              break
+            elif [ "$STATUS" = "unhealthy" ]; then
+              docker logs --tail 50 boyjack-os
+              echo "Container reported unhealthy — check logs above."
+              exit 1
+            fi
+            sleep 5
+          done
+
+          echo ""
+          echo "=== Deploy complete ==="
+          docker ps --filter name=boyjack-os
+
+          # Prune dangling images — keeps 512 GB disk clean
+          docker image prune -f
+          REMOTE
+
+      # ── 4. Clean up private key from runner ──────────────────────────────
+      - name: Remove SSH private key from runner
+        if: always()
+        run: rm -f ~/.ssh/boyjack_deploy ~/.ssh/boyjack_deploy.pub ~/.ssh/config
+
+  # ─────────────────────────────────────────────────────────────────────────
   # JOB 3a — Deploy to remote server via SSH
   # Secrets required: SERVER_HOST, SERVER_USER, SERVER_SSH_KEY
   # Optional secret : SERVER_PORT (defaults to 22)
