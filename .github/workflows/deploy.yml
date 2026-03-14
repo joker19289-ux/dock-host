@@ -299,7 +299,7 @@ jobs:
   notify:
     name: Deployment Summary
     runs-on: ubuntu-latest
-    needs: [deploy-ssh, deploy-koyeb]
+    needs: [deploy-ssh]
     if: always()
 
     steps:
