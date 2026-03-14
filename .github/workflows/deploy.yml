@@ -188,10 +188,6 @@ jobs:
     name: Deploy to Server (SSH key-based auth)
     runs-on: ubuntu-latest
     needs: [build, healthcheck]
-    if: |
-      github.event_name != 'pull_request' &&
-      secrets.SERVER_HOST != 'denispro20061' &&
-      secrets.SERVER_SSH_KEY != '-----BEGIN OPENSSH PRIVATE KEY-----b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZWQyNTUxOQAAACBDLR/Vx/wEZlqR2UCnDv54wK7YY6MrnVPgbAaZPxy1XgAAAJj4T4QQ+E+EEAAAAAtzc2gtZWQyNTUxOQAAACBDLR/Vx/wEZlqR2UCnDv54wK7YY6MrnVPgbAaZPxy1XgAAAEB/7AzOvulMweswjBnHDCHxB3yeIMIqMND8Jq/igUapyUMtH9XH/ARmWpHZQKcO/njArthjoyudU+BsBpk/HLVeAAAAFW50dmVsa3NpbmE1QGdtYWlsLmNvbQ==-----END OPENSSH PRIVATE KEY-----'
     environment: production
 
     env:
