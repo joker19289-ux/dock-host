@@ -1,0 +1,280 @@
+name: BoyJack OS — Build & Deploy
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: boyjack-os
+  REGISTRY: ghcr.io
+  REGISTRY_IMAGE: ghcr.io/${{ github.repository_owner }}/boyjack-os
+
+  # ── NixOS package list (all packages, 512 GB free disk) ──────────────────
+  NIX_PACKAGES: >-
+    novnc tigervnc fluxbox firefox gedit pcmanfm
+    feh xterm xorg.xinit xorg.xauth xorg.xsetroot
+    python3 xdotool wish curl wget git
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 1 — Build & push Docker image
+  # Base image : nixos/nix:latest  (lightweight, all-in-one)
+  # Packages   : $NIX_PACKAGES
+  # Disk       : 512 GB free (GitHub-hosted large runner or self-hosted)
+  # ─────────────────────────────────────────────────────────────────────────
+  build:
+    name: Build Docker Image (nixos/nix:latest)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      image_tag:    ${{ steps.meta.outputs.tags }}
+      image_digest: ${{ steps.build-push.outputs.digest }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free up disk space (up to 512 GB target)
+        run: |
+          echo "=== Disk before cleanup ==="
+          df -h
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache \
+                      /usr/local/lib/android /usr/local/share/boost 2>/dev/null || true
+          docker system prune -af 2>/dev/null || true
+          echo "=== Disk after cleanup ==="
+          df -h
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            network=host
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata (tags & labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        id: build-push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+      - name: Print image digest
+        run: echo "Pushed ${{ env.REGISTRY_IMAGE }}@${{ steps.build-push.outputs.digest }}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 2 — Health-check smoke test (no timeout — polls until ready)
+  # Checks port 5000 (noVNC web) first, then falls back to port 5901 (VNC).
+  # ─────────────────────────────────────────────────────────────────────────
+  healthcheck:
+    name: Health Check — Auto-detect (no timeout)
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name != 'pull_request'
+
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull built image
+        run: docker pull ${{ env.REGISTRY_IMAGE }}:latest
+
+      - name: Start container (ports 5000 + 5901)
+        run: |
+          docker run -d \
+            --name boyjack-test \
+            -p 5000:5000 \
+            -p 5901:5901 \
+            -e DISPLAY=:1 \
+            -e HOME=/app \
+            ${{ env.REGISTRY_IMAGE }}:latest
+
+      # ── No fixed timeout: poll until the service answers ─────────────────
+      - name: Auto-detect service health — web port 5000 (no timeout)
+        run: |
+          echo "Polling http://localhost:5000/vnc.html until ready..."
+          attempt=0
+          while true; do
+            attempt=$((attempt + 1))
+            STATUS=$(curl -o /dev/null -s -w "%{http_code}" \
+                     --max-time 5 \
+                     http://localhost:5000/vnc.html 2>/dev/null || echo "000")
+            echo "  [attempt $attempt] HTTP $STATUS"
+            if [ "$STATUS" = "200" ]; then
+              echo "Web interface is healthy (HTTP 200) after $attempt attempts."
+              break
+            fi
+            sleep 5
+          done
+
+      - name: Verify VNC port 5901 is open
+        run: |
+          echo "Checking VNC port 5901..."
+          attempt=0
+          while true; do
+            attempt=$((attempt + 1))
+            if nc -z localhost 5901 2>/dev/null; then
+              echo "VNC port 5901 is open after $attempt attempts."
+              break
+            fi
+            echo "  [attempt $attempt] VNC port not yet open, retrying..."
+            sleep 3
+          done
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: docker logs boyjack-test
+
+      - name: Stop and remove test container
+        if: always()
+        run: docker rm -f boyjack-test || true
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 3a — Deploy to remote server via SSH
+  # Secrets required: SERVER_HOST, SERVER_USER, SERVER_SSH_KEY
+  # Optional secret : SERVER_PORT (defaults to 22)
+  # ─────────────────────────────────────────────────────────────────────────
+  deploy-ssh:
+    name: Deploy to Server (SSH)
+    runs-on: ubuntu-latest
+    needs: [build, healthcheck]
+    if: |
+      github.event_name != 'pull_request' &&
+      secrets.SERVER_HOST != '' &&
+      secrets.SERVER_SSH_KEY != ''
+    environment: production
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:     ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key:      ${{ secrets.SERVER_SSH_KEY }}
+          port:     ${{ secrets.SERVER_PORT || 22 }}
+          # No command_timeout set → unlimited
+          script: |
+            set -e
+
+            echo "=== BoyJack OS — Rolling Deploy ==="
+            echo "    Base  : nixos/nix:latest"
+            echo "    Image : ${{ env.REGISTRY_IMAGE }}:latest"
+            echo "    Web   : 5000 | VNC : 5901"
+
+            # Authenticate with GHCR on remote host
+            echo "${{ secrets.GITHUB_TOKEN }}" | \
+              docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            # Pull the latest image
+            docker pull ${{ env.REGISTRY_IMAGE }}:latest
+
+            # Gracefully stop & remove old container
+            docker stop boyjack-os 2>/dev/null || true
+            docker rm   boyjack-os 2>/dev/null || true
+
+            # Start new container
+            # Health check: no timeout — polls indefinitely
+            docker run -d \
+              --name boyjack-os \
+              --restart unless-stopped \
+              -p 5000:5000 \
+              -p 5901:5901 \
+              -e DISPLAY=:1 \
+              -e HOME=/app \
+              --health-cmd      "curl -f http://localhost:5000/vnc.html || nc -z localhost 5901" \
+              --health-interval 15s \
+              --health-retries  0 \
+              --health-start-period 0s \
+              ${{ env.REGISTRY_IMAGE }}:latest
+
+            echo ""
+            echo "=== Waiting for container to become healthy (no timeout) ==="
+            while true; do
+              STATUS=$(docker inspect --format='{{.State.Health.Status}}' boyjack-os 2>/dev/null || echo "unknown")
+              echo "  Health status: $STATUS"
+              if [ "$STATUS" = "healthy" ]; then
+                echo "Container is healthy!"
+                break
+              elif [ "$STATUS" = "unhealthy" ]; then
+                docker logs --tail 50 boyjack-os
+                echo "Container reported unhealthy — check logs above."
+                exit 1
+              fi
+              sleep 5
+            done
+
+            echo ""
+            echo "=== Deploy complete ==="
+            docker ps --filter name=boyjack-os
+
+            # Prune dangling images — keeps 512 GB disk clean
+            docker image prune -f
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 3 — Summary notification (always runs)
+  # ─────────────────────────────────────────────────────────────────────────
+  notify:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [deploy-ssh, deploy-koyeb]
+    if: always()
+
+    steps:
+      - name: Print deployment summary
+        run: |
+          echo "╔══════════════════════════════════════════════╗"
+          echo "║        BoyJack OS — Deployment Summary       ║"
+          echo "╠══════════════════════════════════════════════╣"
+          echo "║  Base image : nixos/nix:latest               ║"
+          echo "║  Disk       : 512 GB free                    ║"
+          echo "║  Branch     : ${{ github.ref_name }}"
+          echo "║  Commit     : ${{ github.sha }}"
+          echo "║  Image      : ${{ env.REGISTRY_IMAGE }}:latest"
+          echo "╠══════════════════════════════════════════════╣"
+          echo "║  Packages installed via nix-shell:           ║"
+          echo "║    novnc  tigervnc  fluxbox  firefox         ║"
+          echo "║    gedit  pcmanfm  feh  xterm  python3       ║"
+          echo "║    xdotool  wish  curl  wget  git            ║"
+          echo "╠══════════════════════════════════════════════╣"
+          echo "║  Ports                                       ║"
+          echo "║    5000 → noVNC web interface                ║"
+          echo "║    5901 → TigerVNC server                    ║"
+          echo "║  Health check : auto-detect, no timeout      ║"
+          echo "╚══════════════════════════════════════════════╝"
