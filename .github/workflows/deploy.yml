@@ -190,8 +190,8 @@ jobs:
     needs: [build, healthcheck]
     if: |
       github.event_name != 'pull_request' &&
-      secrets.SERVER_HOST != '' &&
-      secrets.SERVER_SSH_KEY != ''
+      secrets.SERVER_HOST != 'denispro20061' &&
+      secrets.SERVER_SSH_KEY != '-----BEGIN OPENSSH PRIVATE KEY-----b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZWQyNTUxOQAAACBDLR/Vx/wEZlqR2UCnDv54wK7YY6MrnVPgbAaZPxy1XgAAAJj4T4QQ+E+EEAAAAAtzc2gtZWQyNTUxOQAAACBDLR/Vx/wEZlqR2UCnDv54wK7YY6MrnVPgbAaZPxy1XgAAAEB/7AzOvulMweswjBnHDCHxB3yeIMIqMND8Jq/igUapyUMtH9XH/ARmWpHZQKcO/njArthjoyudU+BsBpk/HLVeAAAAFW50dmVsa3NpbmE1QGdtYWlsLmNvbQ==-----END OPENSSH PRIVATE KEY-----'
     environment: production
 
     env:
@@ -221,18 +221,9 @@ jobs:
           chmod 600 ~/.ssh/known_hosts
 
           # SSH client config: use only our deploy key, no password fallback
-          cat >> ~/.ssh/config << EOF
-          Host boyjack-server
-            HostName       $SSH_HOST
-            User           $SSH_USER
-            Port           $SSH_PORT
-            IdentityFile   ~/.ssh/boyjack_deploy
-            IdentitiesOnly yes
-            StrictHostKeyChecking yes
-            PasswordAuthentication no
-            ServerAliveInterval 30
-            ServerAliveCountMax 0
-          EOF
+          # Using printf to avoid << YAML merge-key conflicts
+          printf 'Host boyjack-server\n  HostName %s\n  User %s\n  Port %s\n  IdentityFile ~/.ssh/boyjack_deploy\n  IdentitiesOnly yes\n  StrictHostKeyChecking yes\n  PasswordAuthentication no\n  ServerAliveInterval 30\n  ServerAliveCountMax 0\n' \
+            "$SSH_HOST" "$SSH_USER" "$SSH_PORT" >> ~/.ssh/config
           chmod 600 ~/.ssh/config
 
       # ── 2. Verify the key is accepted before deploying ───────────────────
@@ -241,115 +232,27 @@ jobs:
           ssh boyjack-server "echo 'SSH key auth OK — connected as $(whoami) on $(hostname)'"
 
       # ── 3. Rolling deploy via SSH ─────────────────────────────────────────
+      # Script is passed via env var → piped into ssh bash -s
+      # This avoids any << YAML merge-key conflicts inside run: blocks.
       - name: Deploy BoyJack OS
-        run: |
-          ssh boyjack-server bash -s << 'REMOTE'
-          set -e
-
-          echo "=== BoyJack OS — Rolling Deploy ==="
-          echo "    Base  : nixos/nix:latest"
-          echo "    Image : ${{ env.REGISTRY_IMAGE }}:latest"
-          echo "    Web   : 5000 | VNC : 5901"
-
-          # Authenticate with GHCR
-          echo "${{ secrets.GITHUB_TOKEN }}" | \
-            docker login ghcr.io -u ${{ github.actor }} --password-stdin
-
-          # Pull latest image
-          docker pull ${{ env.REGISTRY_IMAGE }}:latest
-
-          # Gracefully stop & remove old container
-          docker stop boyjack-os 2>/dev/null || true
-          docker rm   boyjack-os 2>/dev/null || true
-
-          # Start new container — health check polls indefinitely (no timeout)
-          docker run -d \
-            --name boyjack-os \
-            --restart unless-stopped \
-            -p 5000:5000 \
-            -p 5901:5901 \
-            -e DISPLAY=:1 \
-            -e HOME=/app \
-            --health-cmd      "curl -f http://localhost:5000/vnc.html || nc -z localhost 5901" \
-            --health-interval 15s \
-            --health-retries  0 \
-            --health-start-period 0s \
-            ${{ env.REGISTRY_IMAGE }}:latest
-
-          echo ""
-          echo "=== Waiting for container to become healthy (no timeout) ==="
-          while true; do
-            STATUS=$(docker inspect --format='{{.State.Health.Status}}' boyjack-os 2>/dev/null || echo "unknown")
-            echo "  Health status: $STATUS"
-            if [ "$STATUS" = "healthy" ]; then
-              echo "Container is healthy!"
-              break
-            elif [ "$STATUS" = "unhealthy" ]; then
-              docker logs --tail 50 boyjack-os
-              echo "Container reported unhealthy — check logs above."
-              exit 1
-            fi
-            sleep 5
-          done
-
-          echo ""
-          echo "=== Deploy complete ==="
-          docker ps --filter name=boyjack-os
-
-          # Prune dangling images — keeps 512 GB disk clean
-          docker image prune -f
-          REMOTE
-
-      # ── 4. Clean up private key from runner ──────────────────────────────
-      - name: Remove SSH private key from runner
-        if: always()
-        run: rm -f ~/.ssh/boyjack_deploy ~/.ssh/boyjack_deploy.pub ~/.ssh/config
-
-  # ─────────────────────────────────────────────────────────────────────────
-  # JOB 3a — Deploy to remote server via SSH
-  # Secrets required: SERVER_HOST, SERVER_USER, SERVER_SSH_KEY
-  # Optional secret : SERVER_PORT (defaults to 22)
-  # ─────────────────────────────────────────────────────────────────────────
-  deploy-ssh:
-    name: Deploy to Server (SSH)
-    runs-on: ubuntu-latest
-    needs: [build, healthcheck]
-    if: |
-      github.event_name != 'pull_request' &&
-      secrets.SERVER_HOST != '' &&
-      secrets.SERVER_SSH_KEY != ''
-    environment: production
-
-    steps:
-      - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host:     ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USER }}
-          key:      ${{ secrets.SERVER_SSH_KEY }}
-          port:     ${{ secrets.SERVER_PORT || 22 }}
-          # No command_timeout set → unlimited
-          script: |
+        env:
+          REGISTRY_IMAGE: ${{ env.REGISTRY_IMAGE }}
+          ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPLOY_SCRIPT: |
             set -e
-
             echo "=== BoyJack OS — Rolling Deploy ==="
             echo "    Base  : nixos/nix:latest"
-            echo "    Image : ${{ env.REGISTRY_IMAGE }}:latest"
+            echo "    Image : ${REGISTRY_IMAGE}:latest"
             echo "    Web   : 5000 | VNC : 5901"
 
-            # Authenticate with GHCR on remote host
-            echo "${{ secrets.GITHUB_TOKEN }}" | \
-              docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            echo "${GH_TOKEN}" | docker login ghcr.io -u "${ACTOR}" --password-stdin
 
-            # Pull the latest image
-            docker pull ${{ env.REGISTRY_IMAGE }}:latest
+            docker pull "${REGISTRY_IMAGE}:latest"
 
-            # Gracefully stop & remove old container
             docker stop boyjack-os 2>/dev/null || true
             docker rm   boyjack-os 2>/dev/null || true
 
-            # Start new container
-            # Health check: no timeout — polls indefinitely
             docker run -d \
               --name boyjack-os \
               --restart unless-stopped \
@@ -361,30 +264,38 @@ jobs:
               --health-interval 15s \
               --health-retries  0 \
               --health-start-period 0s \
-              ${{ env.REGISTRY_IMAGE }}:latest
+              "${REGISTRY_IMAGE}:latest"
 
-            echo ""
             echo "=== Waiting for container to become healthy (no timeout) ==="
             while true; do
               STATUS=$(docker inspect --format='{{.State.Health.Status}}' boyjack-os 2>/dev/null || echo "unknown")
-              echo "  Health status: $STATUS"
-              if [ "$STATUS" = "healthy" ]; then
+              echo "  Health status: ${STATUS}"
+              if [ "${STATUS}" = "healthy" ]; then
                 echo "Container is healthy!"
                 break
-              elif [ "$STATUS" = "unhealthy" ]; then
+              elif [ "${STATUS}" = "unhealthy" ]; then
                 docker logs --tail 50 boyjack-os
-                echo "Container reported unhealthy — check logs above."
+                echo "Container reported unhealthy."
                 exit 1
               fi
               sleep 5
             done
 
-            echo ""
             echo "=== Deploy complete ==="
             docker ps --filter name=boyjack-os
-
-            # Prune dangling images — keeps 512 GB disk clean
             docker image prune -f
+        run: |
+          printf '%s' "$DEPLOY_SCRIPT" | \
+            ssh boyjack-server \
+              REGISTRY_IMAGE="$REGISTRY_IMAGE" \
+              ACTOR="$ACTOR" \
+              GH_TOKEN="$GH_TOKEN" \
+              bash -s
+
+      # ── 4. Clean up private key from runner ──────────────────────────────
+      - name: Remove SSH private key from runner
+        if: always()
+        run: rm -f ~/.ssh/boyjack_deploy ~/.ssh/boyjack_deploy.pub ~/.ssh/config
 
   # ─────────────────────────────────────────────────────────────────────────
   # JOB 3 — Summary notification (always runs)
