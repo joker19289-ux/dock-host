@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  boyjack-os:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: boyjack-os
+    ports:
+      - "5000:5000"  # Web interface (noVNC)
+      - "5901:5901"  # VNC server
+    environment:
+      - DISPLAY=:1
+      - HOME=/app
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/vnc.html"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    # For persistent data (optional)
+    # volumes:
+    #   - boyjack-data:/app/data
+
+# volumes:
+#   boyjack-data:
+#     driver: local

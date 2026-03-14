@@ -1,0 +1,36 @@
+# fly.toml generated for docker-ubuntu-desktop
+app = "docker-ubuntu-desktop"
+
+# Автоматически создаем и используем регион
+primary_region = "ams"  # Можно поменять на ближайший: fra, lhr, etc.
+
+[build]
+  # Используем Dockerfile в корне проекта
+  dockerfile = "./Dockerfile"
+
+[env]
+  # Настройки VNC / noVNC
+  VNC_PASSWORD = "ubuntu"   # Пароль для VNC
+  DISPLAY = ":1"
+  RESOLUTION = "1920x1080x24"
+
+[experimental]
+  auto_rollback = true
+
+[[services]]
+  internal_port = 6080      # noVNC порт внутри контейнера
+  protocol = "tcp"
+
+  [[services.ports]]
+    port = 80               # Порт Fly.io
+    handlers = ["http"]
+
+  [[services.ports]]
+    port = 443              # HTTPS
+    handlers = ["tls", "http"]
+
+  [[services.tcp_checks]]
+    interval = 10000
+    timeout = 2000
+    grace_period = "10s"
+    restart_limit = 0
