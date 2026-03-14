@@ -1,7 +1,7 @@
 # BoyJack OS — Production Dockerfile for Koyeb
 # Optimized for cloud deployment with minimal image size
 
-FROM nixos/nix:latest
+FROM --platform=linux/amd64 ubuntu:22.04
 
 WORKDIR /app
 
@@ -11,7 +11,7 @@ COPY www ./www/
 
 # Install dependencies using nix package manager
 # Includes: VNC server, web client, window manager, terminal, browsers
-RUN nix-shell -p novnc tigervnc xterm fluxbox firefox gedit pcmanfm feh xorg.xinit xorg.xauth xorg.xsetroot python3 xdotool wish curl --run "echo 'Dependencies installed successfully'"
+RUN apt update -y && apt install novnc tigervnc xterm fluxbox firefox gedit pcmanfm feh xorg.xinit xorg.xauth xorg.xsetroot python3 xdotool wish curl
 
 # Environment variables for X11 and Koyeb
 ENV DISPLAY=:1 \
@@ -20,7 +20,7 @@ ENV DISPLAY=:1 \
     PORT=5000
 
 # Health check for Koyeb container orchestration
-HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+HEALTHCHECK --interval=3600m --start-period=3600m --retries=3 \
   CMD curl -f http://localhost:5000/vnc.html || exit 1
 
 # Expose ports
